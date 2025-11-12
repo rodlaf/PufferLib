@@ -904,11 +904,11 @@ class Drone(nn.Module):
 
 
 class F16Waypoint(nn.Module):
-    ''' F16 Waypoint policy - continuous action only.
-    Deep residual network with layer normalization.
-    Obs: 28D -> Deep hidden layers -> 4D actions (Nz, ps, Ny_r, throttle)
+    '''F16 Waypoint policy - matches LinearContLSTM structure for C inference.
+    Architecture: obs (28) -> Linear(128) -> GELU -> LSTM(128) -> actor/value
+    This matches the drone_race.c LinearContLSTM structure exactly.
     '''
-    def __init__(self, env, hidden_size, **kwargs):
+    def __init__(self, env, hidden_size=128, **kwargs):
         super().__init__()
         self.is_continuous = True
         self.hidden_size = hidden_size
@@ -916,50 +916,25 @@ class F16Waypoint(nn.Module):
         obs_dim = np.prod(env.single_observation_space.shape)  # 28
         action_dim = env.single_action_space.shape[0]  # 4
         
-        # Encoder: 28 -> hidden -> hidden (with residuals and layer norm)
-        self.input_proj = pufferlib.pytorch.layer_init(nn.Linear(obs_dim, hidden_size))
-        self.input_norm = nn.LayerNorm(hidden_size)
+        # Must match LinearContLSTM structure in C:
+        # 1. log_std parameter (action_dim floats)
+        self.decoder_logstd = nn.Parameter(torch.zeros(action_dim))
         
-        # Residual blocks
-        self.block1 = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-        )
-        self.block2 = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-        )
-        self.block3 = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-        )
-        self.block4 = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
+        # 2. encoder: Linear layer (obs_dim -> hidden_size)
+        self.encoder = pufferlib.pytorch.layer_init(
+            nn.Linear(obs_dim, hidden_size)
         )
         
-        # Actor head: hidden -> hidden/2 -> actions
-        self.actor_hidden = hidden_size // 2
-        self.decoder_mean = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, self.actor_hidden)),
-            nn.LayerNorm(self.actor_hidden),
-            nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Linear(self.actor_hidden, action_dim), std=0.01),
+        # 3. No explicit GELU needed - handled by LSTMWrapper
+        
+        # 4. actor: Linear layer (hidden_size -> action_dim)
+        self.decoder_mean = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, action_dim), std=0.01
         )
         
-        # Learnable log std - initialize to -1 for smaller initial std
-        self.decoder_logstd = nn.Parameter(torch.ones(1, action_dim) * -1.0)
-        
-        # Value head: hidden -> hidden/2 -> 1
-        self.value = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, self.actor_hidden)),
-            nn.LayerNorm(self.actor_hidden),
-            nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Linear(self.actor_hidden, 1), std=1),
+        # 5. value_fn: Linear layer (hidden_size -> 1)
+        self.value = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1
         )
 
     def forward_eval(self, observations, state=None):
@@ -971,40 +946,20 @@ class F16Waypoint(nn.Module):
         return self.forward_eval(observations, state)
 
     def encode_observations(self, observations, state=None):
-        '''Encodes observations with residual connections'''
         batch_size = observations.shape[0]
         x = observations.view(batch_size, -1).float()
-        
-        # Initial projection
-        x = self.input_norm(self.input_proj(x))
-        x = torch.nn.functional.gelu(x)
-        
-        # Residual blocks
-        x = x + self.block1(x)
-        x = x + self.block2(x)
-        x = x + self.block3(x)
-        x = x + self.block4(x)
-        
-        return x
+        # encoder -> GELU (applied here instead of separate layer)
+        hidden = self.encoder(x)
+        hidden = F.gelu(hidden)
+        return hidden
 
     def decode_actions(self, hidden):
-        '''Decodes hidden states into continuous action distribution with extra safety'''
         mean = self.decoder_mean(hidden)
-        
-        # Clamp mean to prevent extreme values
-        mean = torch.clamp(mean, min=-10.0, max=10.0)
-        
         logstd = self.decoder_logstd.expand_as(mean)
         
-        # CRITICAL: Clamp logstd to prevent numerical instability
-        # This ensures std stays in range [exp(-20), exp(2)] ≈ [2e-9, 7.4]
+        # Clamp logstd for stability
         logstd = torch.clamp(logstd, min=-20.0, max=2.0)
         std = torch.exp(logstd)
-        
-        # Extra safety: ensure std is strictly positive and not NaN
-        std = torch.clamp(std, min=1e-8, max=10.0)
-        std = torch.where(torch.isnan(std), torch.ones_like(std), std)
-        mean = torch.where(torch.isnan(mean), torch.zeros_like(mean), mean)
         
         logits = torch.distributions.Normal(mean, std)
         values = self.value(hidden)

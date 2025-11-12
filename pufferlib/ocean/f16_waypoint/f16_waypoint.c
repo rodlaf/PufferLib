@@ -1,16 +1,120 @@
-/* F-16 Waypoint Demo - Standalone C version
- * Compile: gcc -o f16_waypoint f16_waypoint.c $(pkg-config --cflags --libs raylib) -lm -O3
- * Run: ./f16_waypoint
+/* F-16 Waypoint Neural Network Inference Demo - Standalone C version
+ * Build it with:
+ * bash scripts/build_ocean.sh f16_waypoint local (debug)
+ * bash scripts/build_ocean.sh f16_waypoint fast
+ * 
+ * This replaces the autopilot with a trained neural network policy.
+ * Weights are exported by running: puffer export puffer_f16_waypoint
  */
 
 #include "f16_waypoint.h"
+#include "puffernet.h"
 #include <stdio.h>
 #include <time.h>
 #include <sys/time.h>
+#include <string.h>
 
 /* Playback configuration */
-#define PLAYBACK_SPEED 10.0   /* 1.0 = real-time, 2.0 = 2x speed, 0.5 = half speed */
+#define PLAYBACK_SPEED 1.0   /* 1.0 = real-time, 2.0 = 2x speed, 0.5 = half speed */
 #define RENDER_FPS 60        /* Target frames per second for rendering */
+
+/* Box-Muller transform for sampling from Normal distribution */
+double randn(double mean, double std) {
+    static int has_spare = 0;
+    static double spare;
+
+    if (has_spare) {
+        has_spare = 0;
+        return mean + std * spare;
+    }
+
+    has_spare = 1;
+    double u, v, s;
+    do {
+        u = 2.0 * rand() / RAND_MAX - 1.0;
+        v = 2.0 * rand() / RAND_MAX - 1.0;
+        s = u * u + v * v;
+    } while (s >= 1.0 || s == 0.0);
+
+    s = sqrt(-2.0 * log(s) / s);
+    spare = v * s;
+    return mean + std * (u * s);
+}
+
+/* LinearContLSTM structure for continuous action policies
+ * This matches the F16Waypoint Python model structure exactly:
+ * - encoder: Linear(input_dim -> 128)
+ * - GELU activation
+ * - LSTM(128 -> 128)
+ * - actor: Linear(128 -> num_actions)
+ * - value_fn: Linear(128 -> 1)
+ * - log_std: trainable parameter (num_actions floats)
+ */
+typedef struct LinearContLSTM LinearContLSTM;
+struct LinearContLSTM {
+    int num_agents;
+    float *obs;
+    float *log_std;
+    Linear *encoder;
+    GELU *gelu1;
+    LSTM *lstm;
+    Linear *actor;
+    Linear *value_fn;
+    int num_actions;
+};
+
+LinearContLSTM *make_linearcontlstm(Weights *weights, int num_agents, int input_dim,
+                                    int logit_sizes[], int num_actions) {
+    LinearContLSTM *net = calloc(1, sizeof(LinearContLSTM));
+    net->num_agents = num_agents;
+    net->obs = calloc(num_agents * input_dim, sizeof(float));
+    net->num_actions = logit_sizes[0];
+    
+    // Read log_std parameters
+    net->log_std = weights->data;
+    weights->idx += net->num_actions;
+    
+    // Build network: encoder -> GELU -> LSTM -> actor/value
+    net->encoder = make_linear(weights, num_agents, input_dim, 128);
+    net->gelu1 = make_gelu(num_agents, 128);
+    
+    int atn_sum = 0;
+    for (int i = 0; i < num_actions; i++) {
+        atn_sum += logit_sizes[i];
+    }
+    
+    net->actor = make_linear(weights, num_agents, 128, atn_sum);
+    net->value_fn = make_linear(weights, num_agents, 128, 1);
+    net->lstm = make_lstm(weights, num_agents, 128, 128);
+    
+    return net;
+}
+
+void free_linearcontlstm(LinearContLSTM *net) {
+    free(net->obs);
+    free(net->encoder);
+    free(net->gelu1);
+    free(net->actor);
+    free(net->value_fn);
+    free(net->lstm);
+    free(net);
+}
+
+void forward_linearcontlstm(LinearContLSTM *net, float *observations, float *actions) {
+    // Forward pass: encoder -> GELU -> LSTM -> actor
+    linear(net->encoder, observations);
+    gelu(net->gelu1, net->encoder->output);
+    lstm(net->lstm, net->gelu1->output);
+    linear(net->actor, net->lstm->state_h);
+    linear(net->value_fn, net->lstm->state_h);
+    
+    // Sample actions from Normal(mean, std)
+    for (int i = 0; i < net->num_actions; i++) {
+        float std = expf(net->log_std[i]);
+        float mean = net->actor->output[i];
+        actions[i] = randn(mean, std);
+    }
+}
 
 /* Get wall-clock time in seconds */
 static double get_wall_time(void) {
@@ -19,176 +123,71 @@ static double get_wall_time(void) {
     return (double)time.tv_sec + (double)time.tv_usec * 1e-6;
 }
 
-/* Autopilot configuration */
-typedef struct {
-    double waypoint[3];
-    
-    /* Gains */
-    double cfg_k_vt;
-    double cfg_airspeed;
-    double cfg_k_alt;
-    double cfg_k_h_dot;
-    double cfg_k_prop_psi;
-    double cfg_k_der_psi;
-    double cfg_k_prop_phi;
-    double cfg_k_der_phi;
-    double cfg_max_bank_deg;
-    double cfg_max_nz_cmd;
-    double cfg_min_nz_cmd;
-} Autopilot;
-
-/* Initialize autopilot with waypoint */
-void autopilot_init(Autopilot* ap, const double waypoint[3]) {
-    ap->waypoint[0] = waypoint[0];
-    ap->waypoint[1] = waypoint[1];
-    ap->waypoint[2] = waypoint[2];
-    
-    ap->cfg_k_vt = 0.25;
-    ap->cfg_airspeed = 550.0;
-    ap->cfg_k_alt = 0.005;
-    ap->cfg_k_h_dot = 0.02;
-    ap->cfg_k_prop_psi = 5.0;
-    ap->cfg_k_der_psi = 0.5;
-    ap->cfg_k_prop_phi = 0.75;
-    ap->cfg_k_der_phi = 0.5;
-    ap->cfg_max_bank_deg = 65.0;
-    ap->cfg_max_nz_cmd = 4.0;
-    ap->cfg_min_nz_cmd = -1.0;
-}
-
-/* Update autopilot waypoint */
-void autopilot_update_waypoint(Autopilot* ap, const double waypoint[3]) {
-    ap->waypoint[0] = waypoint[0];
-    ap->waypoint[1] = waypoint[1];
-    ap->waypoint[2] = waypoint[2];
-}
-
-/* Get heading to waypoint */
-static double get_waypoint_heading(Autopilot* ap, const double* state) {
-    double e_pos = state[POSE];
-    double n_pos = state[POSN];
-    double delta_e = ap->waypoint[0] - e_pos;
-    double delta_n = ap->waypoint[1] - n_pos;
-    return wrap_to_pi(PI/2.0 - atan2(delta_n, delta_e));
-}
-
-/* Get path angle gamma */
-static double get_path_angle(const double* state) {
-    double alpha = state[ALPHA];
-    double beta = state[BETA];
-    double phi = state[PHI];
-    double theta = state[THETA];
-    
-    return asin((cos(alpha)*sin(theta) - 
-                 sin(alpha)*cos(theta)*cos(phi))*cos(beta) - 
-                (cos(theta)*sin(phi))*sin(beta));
-}
-
-/* Track altitude wings level */
-static double track_altitude_wings_level(Autopilot* ap, const double* state) {
-    double h_cmd = ap->waypoint[2];
-    double vt = state[VT];
-    double h = state[ALT];
-    double h_error = h_cmd - h;
-    double gamma = get_path_angle(state);
-    double h_dot = vt * sin(gamma);
-    return ap->cfg_k_alt * h_error - ap->cfg_k_h_dot * h_dot;
-}
-
-/* Get Nz for level turn */
-static double get_nz_for_level_turn(const double* state) {
-    double phi = state[PHI];
-    if (fabs(phi) > 1e-6) {
-        return 1.0 / cos(phi) - 1.0;
-    }
-    return 0.0;
-}
-
-/* Track altitude */
-static double track_altitude(Autopilot* ap, const double* state) {
-    double h_cmd = ap->waypoint[2];
-    double h = state[ALT];
-    double phi = state[PHI];
-    double h_error = h_cmd - h;
-    double nz_alt = track_altitude_wings_level(ap, state);
-    double nz_roll = get_nz_for_level_turn(state);
-    
-    if (h_error > 0) {
-        return nz_alt + nz_roll;
-    } else if (fabs(phi) < 15.0 * (PI / 180.0)) {
-        return nz_alt + nz_roll;
-    } else {
-        return fmax(0.0, nz_alt + nz_roll);
-    }
-}
-
-/* Get action from autopilot */
-void autopilot_get_action(Autopilot* ap, const double* state, double u_ref[4]) {
-    /* Get desired heading to waypoint */
-    double psi_cmd = get_waypoint_heading(ap, state);
-    
-    /* PD Control on heading using roll */
-    double psi = wrap_to_pi(state[PSI]);
-    double r = state[R];
-    double psi_err = wrap_to_pi(psi_cmd - psi);
-    double phi_cmd = psi_err * ap->cfg_k_prop_psi - r * ap->cfg_k_der_psi;
-    
-    /* Bound bank angle */
-    double max_bank_rad = ap->cfg_max_bank_deg * (PI / 180.0);
-    phi_cmd = clamp(phi_cmd, -max_bank_rad, max_bank_rad);
-    
-    /* PD control on roll angle */
-    double phi = state[PHI];
-    double p = state[P];
-    double ps_cmd = (phi_cmd - phi) * ap->cfg_k_prop_phi - p * ap->cfg_k_der_phi;
-    
-    /* Track altitude */
-    double nz_cmd = track_altitude(ap, state);
-    nz_cmd = clamp(nz_cmd, ap->cfg_min_nz_cmd, ap->cfg_max_nz_cmd);
-    
-    /* Track airspeed */
-    double throttle = ap->cfg_k_vt * (ap->cfg_airspeed - state[VT]);
-    
-    /* Set control */
-    u_ref[0] = nz_cmd;
-    u_ref[1] = ps_cmd;
-    u_ref[2] = 0.0;  /* Ny_r */
-    u_ref[3] = throttle;
-}
-
 /* Main simulation loop */
 int main(int argc, char** argv) {
-    printf("F-16 Waypoint Demo (Standalone C)\n");
-    printf("==================================\n\n");
+    srand(time(NULL));
     
-    /* Create environment */
+    printf("F-16 Waypoint Neural Network Demo\n");
+    printf("===================================\n\n");
+    
+    /* Create environment on stack (not heap) */
     F16Waypoint env;
     env.step_size = 1.0 / 30.0;
     env.time_limit = 100.0;
     env.seed = (unsigned int)time(NULL);
-    srand(env.seed);
     
-    /* Reset environment using PufferLib API */
+    /* Allocate buffers for vectorized API compatibility */
+    size_t obs_size = OBS_DIM_TOTAL;  // 28
+    size_t act_size = 4;
+    float *observations = (float *)calloc(obs_size, sizeof(float));
+    float *action_buffer = (float *)calloc(act_size, sizeof(float));
+    
+    if (!observations || !action_buffer) {
+        fprintf(stderr, "ERROR: Failed to allocate memory for buffers.\n");
+        free(observations);
+        free(action_buffer);
+        return 1;
+    }
+    
+    /* Load neural network weights */
+    const char* weights_path = "resources/f16_waypoint/f16_waypoint_weights.bin";
+    int num_weights = 137743;  // Will be updated after training
+    
+    printf("Loading weights from: %s\n", weights_path);
+    Weights* weights = load_weights(weights_path, num_weights);
+    if (!weights) {
+        printf("WARNING: Failed to load weights from %s\n", weights_path);
+        printf("Using random actions instead.\n");
+        printf("To train and export weights:\n");
+        printf("  1. Train: puffer train puffer_f16_waypoint\n");
+        printf("  2. Export: puffer export puffer_f16_waypoint\n\n");
+    } else {
+        printf("Weights loaded successfully!\n\n");
+    }
+    
+    /* Create neural network (if weights loaded) */
+    LinearContLSTM *net = NULL;
+    if (weights) {
+        int logit_sizes[1] = {4};  // 4 continuous actions
+        net = make_linearcontlstm(weights, 1, obs_size, logit_sizes, 1);
+    }
+    
+    /* Reset environment */
     c_reset(&env);
     
-    /* Create autopilot */
-    Autopilot autopilot;
-    autopilot_init(&autopilot, env.waypoint);
-    
     printf("Starting simulation...\n");
-    printf("Waypoint: E=%.1f N=%.1f Alt=%.1f\n\n",
+    printf("Initial waypoint: E=%.1f N=%.1f Alt=%.1f\n\n",
            env.waypoint[0], env.waypoint[1], env.waypoint[2]);
     printf("Press ESC to exit\n\n");
     
     /* Timing variables */
     double target_render_dt = 1.0 / RENDER_FPS;
     double last_render_time = get_wall_time();
-    
-    /* Calculate how many simulation steps to run per rendered frame */
-    /* sim_steps_per_frame = (PLAYBACK_SPEED * target_render_dt) / env.step_size */
     double sim_steps_per_frame = (PLAYBACK_SPEED * target_render_dt) / env.step_size;
     
     int waypoint_count = 1;
+    int episode_count = 0;
+    float total_return = 0.0f;
     
     /* Main loop */
     c_render(&env);
@@ -197,40 +196,57 @@ int main(int argc, char** argv) {
         double current_time = get_wall_time();
         double time_since_render = current_time - last_render_time;
         
-        /* Render at target FPS */
         if (time_since_render >= target_render_dt) {
-            /* Run simulation steps for this frame */
-            int steps_this_frame = (int)(sim_steps_per_frame + 0.5);  /* Round to nearest int */
+            int steps_this_frame = (int)(sim_steps_per_frame + 0.5);
             
             for (int step = 0; step < steps_this_frame; step++) {
-                double u_ref[4];
-                autopilot_get_action(&autopilot, env.state, u_ref);
+                /* Get observation */
+                float obs[OBS_DIM_TOTAL];
+                get_observation(&env, obs);
+                memcpy(observations, obs, obs_size * sizeof(float));
                 
-                /* Copy action to env and step */
-                memcpy(env.u_ref, u_ref, 4 * sizeof(double));
+                /* Generate actions */
+                if (net) {
+                    // Use neural network
+                    forward_linearcontlstm(net, observations, action_buffer);
+                    for (int i = 0; i < act_size; i++) {
+                        env.u_ref[i] = (double)action_buffer[i];
+                    }
+                } else {
+                    // Random actions as fallback
+                    for (int i = 0; i < act_size; i++) {
+                        env.u_ref[i] = ((double)rand() / RAND_MAX) * 2.0 - 1.0;
+                    }
+                }
+                
+                /* Step environment */
                 c_step(&env);
+                total_return += env.reward;
                 
                 if (env.terminal) {
-                    /* Episode ended - waypoint captured or physics violation */
-                    int is_success = (env.log.perf > 0);  /* Check if last episode was successful */
+                    episode_count++;
+                    int is_success = (env.log.perf > 0);
+                    
+                    printf("Episode %d complete | Return: %.2f | Success: %s\n",
+                           episode_count, total_return, is_success ? "YES" : "NO");
                     
                     c_clear_trail();
-                    autopilot_update_waypoint(&autopilot, env.waypoint);
                     
                     if (is_success) {
                         waypoint_count++;
-                        printf("Waypoint %d reached!\n", waypoint_count - 1);
-                        printf("New waypoint %d: E=%.1f N=%.1f Alt=%.1f\n\n",
+                        printf("  Waypoint %d reached!\n", waypoint_count - 1);
+                        printf("  New waypoint %d: E=%.1f N=%.1f Alt=%.1f\n\n",
                                waypoint_count, env.waypoint[0], env.waypoint[1], env.waypoint[2]);
                     } else {
-                        printf("Physics violation! Resetting...\n\n");
+                        printf("  Physics violation or timeout\n\n");
                         waypoint_count = 1;
                     }
+                    
+                    total_return = 0.0f;
                     break;
                 }
             }
             
-            /* Render the current state */
             c_render(&env);
             last_render_time = current_time;
         }
@@ -242,8 +258,17 @@ int main(int argc, char** argv) {
         nanosleep(&ts, NULL);
     }
     
+    /* Cleanup */
+    if (net) {
+        free_linearcontlstm(net);
+    }
+    free(observations);
+    free(action_buffer);
     c_close(&env);
+    
     printf("\nSimulation closed\n");
+    printf("Total episodes: %d\n", episode_count);
+    printf("Waypoints reached: %d\n", waypoint_count - 1);
     
     return 0;
 }
