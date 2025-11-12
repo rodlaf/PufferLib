@@ -89,6 +89,8 @@ class Default(nn.Module):
         elif self.is_continuous:
             mean = self.decoder_mean(hidden)
             logstd = self.decoder_logstd.expand_as(mean)
+            # Clamp logstd to prevent numerical instability with Normal distribution
+            logstd = torch.clamp(logstd, min=-20, max=2)
             std = torch.exp(logstd)
             logits = torch.distributions.Normal(mean, std)
         else:

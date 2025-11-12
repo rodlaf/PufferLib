@@ -901,3 +901,74 @@ class Drone(nn.Module):
 
         values = self.value(hidden)
         return logits, values
+
+
+class F16Waypoint(nn.Module):
+    ''' F16 Waypoint policy - continuous action only.
+    Larger network (~15MB) with logstd clamping for stability.
+    Obs: 28D -> Hidden layers -> 4D actions (Nz, ps, Ny_r, throttle)
+    '''
+    def __init__(self, env, hidden_size=1024, **kwargs):
+        super().__init__()
+        self.is_continuous = True  # F16 is always continuous
+        self.hidden_size = hidden_size
+        
+        obs_dim = np.prod(env.single_observation_space.shape)  # 28
+        action_dim = env.single_action_space.shape[0]  # 4
+        
+        # Encoder: 28 -> 512 -> 1024 -> 1024
+        # Output must match hidden_size for LSTM wrapper compatibility
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(obs_dim, 512)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(512, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        
+        # Actor head: 1024 -> 512 -> 4
+        self.decoder_mean = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 512)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(512, action_dim), std=0.01),
+        )
+        
+        # Learnable log std for each action dimension
+        self.decoder_logstd = nn.Parameter(torch.zeros(1, action_dim))
+        
+        # Value head: 1024 -> 512 -> 1
+        self.value = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 512)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(512, 1), std=1),
+        )
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations)
+        logits, values = self.decode_actions(hidden)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        '''Encodes observations: batch x 28 -> batch x hidden_size'''
+        batch_size = observations.shape[0]
+        observations = observations.view(batch_size, -1).float()
+        return self.encoder(observations)
+
+    def decode_actions(self, hidden):
+        '''Decodes hidden states into continuous action distribution'''
+        mean = self.decoder_mean(hidden)
+        logstd = self.decoder_logstd.expand_as(mean)
+        
+        # Clamp logstd to prevent numerical instability: std in [2e-9, 7.4]
+        logstd = torch.clamp(logstd, min=-20, max=2)
+        std = torch.exp(logstd)
+        
+        logits = torch.distributions.Normal(mean, std)
+        values = self.value(hidden)
+        
+        return logits, values
+
