@@ -88,10 +88,21 @@ class Default(nn.Module):
             logits = self.decoder(hidden).split(self.action_nvec, dim=1)
         elif self.is_continuous:
             mean = self.decoder_mean(hidden)
+            
+            # Clamp mean to prevent extreme values
+            mean = torch.clamp(mean, min=-10.0, max=10.0)
+            
             logstd = self.decoder_logstd.expand_as(mean)
+            
             # Clamp logstd to prevent numerical instability with Normal distribution
-            logstd = torch.clamp(logstd, min=-20, max=2)
+            logstd = torch.clamp(logstd, min=-20.0, max=2.0)
             std = torch.exp(logstd)
+            
+            # Extra safety: ensure std is strictly positive and not NaN
+            std = torch.clamp(std, min=1e-8, max=10.0)
+            std = torch.where(torch.isnan(std), torch.ones_like(std), std)
+            mean = torch.where(torch.isnan(mean), torch.zeros_like(mean), mean)
+            
             logits = torch.distributions.Normal(mean, std)
         else:
             logits = self.decoder(hidden)
