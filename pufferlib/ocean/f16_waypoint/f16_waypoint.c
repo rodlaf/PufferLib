@@ -43,11 +43,11 @@ double randn(double mean, double std) {
 
 /* LinearContLSTM structure for continuous action policies
  * This matches the F16Waypoint Python model structure exactly:
- * - encoder: Linear(input_dim -> 128)
+ * - encoder: Linear(input_dim -> 1024)
  * - GELU activation
- * - LSTM(128 -> 128)
- * - actor: Linear(128 -> num_actions)
- * - value_fn: Linear(128 -> 1)
+ * - LSTM(1024 -> 1024)
+ * - actor: Linear(1024 -> num_actions)
+ * - value_fn: Linear(1024 -> 1)
  * - log_std: trainable parameter (num_actions floats)
  */
 typedef struct LinearContLSTM LinearContLSTM;
@@ -71,21 +71,20 @@ LinearContLSTM *make_linearcontlstm(Weights *weights, int num_agents, int input_
     net->num_actions = logit_sizes[0];
     
     // Read log_std parameters
-    net->log_std = weights->data;
-    weights->idx += net->num_actions;
+    net->log_std = get_weights(weights, net->num_actions);
     
     // Build network: encoder -> GELU -> LSTM -> actor/value
-    net->encoder = make_linear(weights, num_agents, input_dim, 128);
-    net->gelu1 = make_gelu(num_agents, 128);
+    net->encoder = make_linear(weights, num_agents, input_dim, 1024);
+    net->gelu1 = make_gelu(num_agents, 1024);
     
     int atn_sum = 0;
     for (int i = 0; i < num_actions; i++) {
         atn_sum += logit_sizes[i];
     }
     
-    net->actor = make_linear(weights, num_agents, 128, atn_sum);
-    net->value_fn = make_linear(weights, num_agents, 128, 1);
-    net->lstm = make_lstm(weights, num_agents, 128, 128);
+    net->actor = make_linear(weights, num_agents, 1024, atn_sum);
+    net->value_fn = make_linear(weights, num_agents, 1024, 1);
+    net->lstm = make_lstm(weights, num_agents, 1024, 1024);
     
     return net;
 }
@@ -150,8 +149,8 @@ int main(int argc, char** argv) {
     }
     
     /* Load neural network weights */
-    const char* weights_path = "resources/f16_waypoint/f16_waypoint_weights.bin";
-    int num_weights = 137743;  // Will be updated after training
+    const char* weights_path = "pufferlib/resources/f16_waypoint/f16_waypoint_weights.bin";
+    int num_weights = 8431625;  // Exact count from exported weights
     
     printf("Loading weights from: %s\n", weights_path);
     Weights* weights = load_weights(weights_path, num_weights);

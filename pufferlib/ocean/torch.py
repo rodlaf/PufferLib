@@ -908,7 +908,7 @@ class F16Waypoint(nn.Module):
     Architecture: obs (28) -> Linear(128) -> GELU -> LSTM(128) -> actor/value
     This matches the drone_race.c LinearContLSTM structure exactly.
     '''
-    def __init__(self, env, hidden_size=128, **kwargs):
+    def __init__(self, env, hidden_size=1024, **kwargs):
         super().__init__()
         self.is_continuous = True
         self.hidden_size = hidden_size
